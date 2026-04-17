@@ -21,6 +21,12 @@ _current_processor = None
 MOSS_MODELS_DIR = os.path.join(folder_paths.models_dir, "moss-tts")
 os.makedirs(MOSS_MODELS_DIR, exist_ok=True)
 
+# Redirect HuggingFace custom-module cache to stay within ComfyUI's model directory
+# instead of the user's ~/.cache/huggingface/modules
+_hf_modules_cache = os.path.join(MOSS_MODELS_DIR, ".hf_modules_cache")
+os.makedirs(_hf_modules_cache, exist_ok=True)
+os.environ.setdefault("HF_MODULES_CACHE", _hf_modules_cache)
+
 
 def _resolve_local_dir(repo_id_or_path):
     """If repo_id_or_path is a HF repo ID, download it into ComfyUI's
@@ -77,11 +83,12 @@ class MossTTSModelLoader:
         # Path(repo_id) bug on Windows (converts / to \)
         local_dir = _resolve_local_dir(model_path)
 
-        processor_kwargs = {"trust_remote_code": True}
-        if model_id == MODEL_ID_TTSD:
-            codec_path = codec_local_path.strip() or DEFAULT_CODEC_PATH
-            processor_kwargs["codec_path"] = _resolve_local_dir(codec_path)
-        elif model_id == MODEL_ID_VOICE_GENERATOR:
+        codec_path = codec_local_path.strip() or DEFAULT_CODEC_PATH
+        processor_kwargs = {
+            "trust_remote_code": True,
+            "codec_path": _resolve_local_dir(codec_path),
+        }
+        if model_id == MODEL_ID_VOICE_GENERATOR:
             processor_kwargs["normalize_inputs"] = True
 
         processor = AutoProcessor.from_pretrained(local_dir, **processor_kwargs)
