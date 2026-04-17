@@ -103,6 +103,25 @@ def _patch_remote_code(local_dir):
         _invalidate_hf_module_cache(_CONFIG_FILES_TO_PATCH)
 
 
+def _expose_text_config(config):
+    """Make the nested language config discoverable by transformers 5.x helpers.
+
+    `PreTrainedConfig.get_text_config(decoder=True)` scans for attributes named
+    `decoder`, `generator`, or `text_config`. MOSS configs nest the text model
+    under `language_config`, so cache initialization (`DynamicCache(...)`) falls
+    back to the top-level config and then fails on missing attributes like
+    `num_hidden_layers`. We alias `language_config` under the expected name so
+    HF utilities route through the Qwen3 sub-config."""
+    nested = getattr(config, "language_config", None)
+    if nested is None:
+        return
+    if getattr(config, "text_config", None) is None:
+        try:
+            config.text_config = nested
+        except Exception:
+            pass
+
+
 def _invalidate_hf_module_cache(filenames):
     """Delete cached copies of the given files from HF_MODULES_CACHE so that
     transformers re-imports them from the patched snapshot."""
@@ -184,6 +203,8 @@ class MossTTSModelLoader:
             torch_dtype=dtype,
         ).to(device)
         model.eval()
+
+        _expose_text_config(model.config)
 
         _current_model = model
         _current_processor = processor
