@@ -122,6 +122,42 @@ def _expose_text_config(config):
             pass
 
 
+def _install_legacy_generation_shims(model):
+    """Restore `GenerationMixin` helpers that MOSS remote `_sample` still calls
+    but that were removed from transformers 5.x.
+
+    `modeling_moss_tts.py::_sample` invokes `self._get_initial_cache_position(
+    cur_len, device, model_kwargs)`, which no longer exists upstream. We bind a
+    minimal replacement onto the model instance that mirrors the old behavior:
+    populate `model_kwargs["cache_position"]` with `arange(cur_len)`, trimmed
+    by any existing `past_key_values` length."""
+    if hasattr(model, "_get_initial_cache_position"):
+        return
+
+    def _get_initial_cache_position(self, cur_len, device, model_kwargs):
+        cache_position = torch.arange(cur_len, dtype=torch.int64, device=device)
+        past = model_kwargs.get("past_key_values")
+        past_length = 0
+        if past is not None:
+            if hasattr(past, "get_seq_length"):
+                try:
+                    past_length = past.get_seq_length()
+                except Exception:
+                    past_length = 0
+            elif isinstance(past, (tuple, list)) and past and isinstance(past[0], (tuple, list)) and past[0]:
+                try:
+                    past_length = past[0][0].shape[2]
+                except Exception:
+                    past_length = 0
+        if past_length:
+            cache_position = cache_position[past_length:]
+        model_kwargs["cache_position"] = cache_position
+        return model_kwargs
+
+    import types
+    model._get_initial_cache_position = types.MethodType(_get_initial_cache_position, model)
+
+
 def _invalidate_hf_module_cache(filenames):
     """Delete cached copies of the given files from HF_MODULES_CACHE so that
     transformers re-imports them from the patched snapshot."""
@@ -205,6 +241,7 @@ class MossTTSModelLoader:
         model.eval()
 
         _expose_text_config(model.config)
+        _install_legacy_generation_shims(model)
 
         _current_model = model
         _current_processor = processor
