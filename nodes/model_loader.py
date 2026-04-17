@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoModel, AutoProcessor
@@ -34,11 +35,93 @@ def _resolve_local_dir(repo_id_or_path):
     If it's already a local path, return it as-is.
     Works around MOSS processor bug: Path(repo_id) mangles / to \\ on Windows."""
     if os.path.isdir(repo_id_or_path):
-        return repo_id_or_path
-    # e.g. "OpenMOSS-Team/MOSS-TTS" → "OpenMOSS-Team--MOSS-TTS"
-    safe_name = repo_id_or_path.replace("/", "--")
-    local_dir = os.path.join(MOSS_MODELS_DIR, safe_name)
-    return snapshot_download(repo_id_or_path, local_dir=local_dir)
+        local = repo_id_or_path
+    else:
+        # e.g. "OpenMOSS-Team/MOSS-TTS" → "OpenMOSS-Team--MOSS-TTS"
+        safe_name = repo_id_or_path.replace("/", "--")
+        local_dir = os.path.join(MOSS_MODELS_DIR, safe_name)
+        local = snapshot_download(repo_id_or_path, local_dir=local_dir)
+
+    _patch_remote_code(local)
+    return local
+
+
+# --- Remote-code compatibility patch for transformers >= 5.0 -----------------
+#
+# transformers 5.x rewrites every `PreTrainedConfig` subclass with
+# `@dataclass(repr=False)` inside `__init_subclass__`. MOSS's remote
+# `configuration_moss_audio_tokenizer.py` declares bare class-level
+# annotations (e.g. `sampling_rate: int`) without defaults. These become
+# no-default dataclass fields *after* default fields inherited from the
+# parent (`problem_type`, `id2label`, ...), which raises:
+#
+#     TypeError: non-default argument 'sampling_rate' follows default
+#                argument 'problem_type'
+#
+# during class creation, before our code ever runs. The annotations are
+# redundant: the hand-written `__init__` already supplies defaults for all
+# of them, so we rewrite each bare `name: type` into an assignment
+# (`name: type = None`) on the downloaded snapshot.
+
+_BARE_ANNOTATION_RE = re.compile(
+    r"^( {4})([A-Za-z_]\w*)[ \t]*:[ \t]*([^=\n]+?)[ \t]*$",
+    re.MULTILINE,
+)
+
+_CONFIG_FILES_TO_PATCH = (
+    "configuration_moss_audio_tokenizer.py",
+)
+
+
+def _patch_remote_code(local_dir):
+    """Strip bare class-level annotations from MOSS config files and invalidate
+    any stale copies in the Hugging Face dynamic module cache so the patched
+    source is re-imported."""
+    patched_any = False
+    for fname in _CONFIG_FILES_TO_PATCH:
+        path = os.path.join(local_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except OSError:
+            continue
+
+        new_source = _BARE_ANNOTATION_RE.sub(r"\1\2: \3 = None", source)
+        if new_source == source:
+            continue
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_source)
+            patched_any = True
+        except OSError:
+            pass
+
+    if patched_any:
+        _invalidate_hf_module_cache(_CONFIG_FILES_TO_PATCH)
+
+
+def _invalidate_hf_module_cache(filenames):
+    """Delete cached copies of the given files from HF_MODULES_CACHE so that
+    transformers re-imports them from the patched snapshot."""
+    try:
+        from transformers.utils import HF_MODULES_CACHE
+    except Exception:
+        return
+
+    modules_root = os.path.join(HF_MODULES_CACHE, "transformers_modules")
+    if not os.path.isdir(modules_root):
+        return
+
+    for root, _dirs, files in os.walk(modules_root):
+        for fname in filenames:
+            if fname in files:
+                try:
+                    os.remove(os.path.join(root, fname))
+                except OSError:
+                    pass
 
 
 class MossTTSModelLoader:
